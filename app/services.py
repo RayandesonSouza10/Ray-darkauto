@@ -1294,20 +1294,33 @@ def _decode_part_image_bytes(part: Any) -> bytes | None:
     return None
 
 
-def _generate_vertex_image(prompt: str, output_path: Path, *, model_name: str) -> tuple[bool, str]:
+def _generate_vertex_image(
+    prompt: str,
+    output_path: Path,
+    *,
+    model_name: str,
+    image_aspect_ratio: str | None = None,
+) -> tuple[bool, str]:
     try:
         client = _build_vertex_client()
     except Exception as exc:
         return False, f"client_init_error: {exc}"
 
+    config: dict[str, Any] = {
+        "response_modalities": ["IMAGE", "TEXT"],
+        "temperature": 0.4,
+    }
+    selected_aspect_ratio = _normalize_video_aspect_ratio(image_aspect_ratio)
+    if selected_aspect_ratio:
+        config["image_config"] = {
+            "aspect_ratio": selected_aspect_ratio,
+        }
+
     try:
         response = client.models.generate_content(
             model=model_name,
             contents=prompt,
-            config={
-                "response_modalities": ["IMAGE", "TEXT"],
-                "temperature": 0.4,
-            },
+            config=config,
         )
     except Exception as exc:
         return False, f"generate_content_error: {exc}"
@@ -1369,12 +1382,18 @@ def _generate_vertex_image_with_retries(
     output_path: Path,
     *,
     model_name: str,
+    image_aspect_ratio: str | None = None,
     max_attempts: int = 3,
 ) -> tuple[bool, str, int]:
     attempts = max(int(max_attempts), 1)
     errors: list[str] = []
     for attempt in range(1, attempts + 1):
-        ok, error = _generate_vertex_image(prompt, output_path, model_name=model_name)
+        ok, error = _generate_vertex_image(
+            prompt,
+            output_path,
+            model_name=model_name,
+            image_aspect_ratio=image_aspect_ratio,
+        )
         if ok:
             return True, "", attempt
         if error:
@@ -1440,6 +1459,41 @@ def _create_placeholder_image(
     image.save(output_path, format="PNG")
 
 
+def _enforce_image_canvas(
+    image_path: Path,
+    *,
+    target_width: int,
+    target_height: int,
+) -> tuple[bool, str]:
+    if target_width <= 0 or target_height <= 0:
+        return False, "invalid_target_canvas"
+    try:
+        from PIL import Image
+    except Exception as exc:
+        return False, f"pillow_unavailable: {exc}"
+
+    try:
+        with Image.open(image_path) as source_image:
+            src_width, src_height = source_image.size
+            if src_width == target_width and src_height == target_height:
+                return True, ""
+
+            scale = max(target_width / max(src_width, 1), target_height / max(src_height, 1))
+            resized_width = max(int(round(src_width * scale)), 1)
+            resized_height = max(int(round(src_height * scale)), 1)
+            resampling_ns = getattr(Image, "Resampling", Image)
+            resample_filter = getattr(resampling_ns, "LANCZOS", Image.LANCZOS)
+            resized = source_image.convert("RGB").resize((resized_width, resized_height), resample_filter)
+
+            left = max((resized_width - target_width) // 2, 0)
+            top = max((resized_height - target_height) // 2, 0)
+            fitted = resized.crop((left, top, left + target_width, top + target_height))
+            fitted.save(image_path, format="PNG")
+            return True, f"canvas_adjusted:{src_width}x{src_height}->{target_width}x{target_height}"
+    except Exception as exc:
+        return False, f"canvas_adjust_error: {exc}"
+
+
 def _prompt_cache_key(prompt: str) -> str:
     compact = re.sub(r"\s+", " ", str(prompt or "")).strip().lower()
     if not compact:
@@ -1452,10 +1506,12 @@ def _generate_scene_images(
     *,
     video_title: str,
     image_model_name: str | None = None,
+    image_aspect_ratio: str | None = None,
     video_width: int = VIDEO_WIDTH,
     video_height: int = VIDEO_HEIGHT,
 ) -> dict[str, Any]:
     model_name = (image_model_name or VERTEX_IMAGE_MODEL).strip() or VERTEX_IMAGE_MODEL
+    selected_aspect_ratio = _normalize_video_aspect_ratio(image_aspect_ratio)
     image_prompts_path = Path(run_result["files"]["image_prompts.json"])
     payload = json.loads(image_prompts_path.read_text(encoding="utf-8"))
     items = payload.get("items") or []
@@ -1513,6 +1569,7 @@ def _generate_scene_images(
                         variant_prompt,
                         out_path,
                         model_name=model_name,
+                        image_aspect_ratio=selected_aspect_ratio,
                         max_attempts=max_attempts,
                     )
                     attempt_total += attempts_used
@@ -1557,6 +1614,17 @@ def _generate_scene_images(
         if prompt_key and out_path.exists():
             prompt_output_cache[prompt_key] = out_path
 
+        if out_path.exists():
+            canvas_ok, canvas_detail = _enforce_image_canvas(
+                out_path,
+                target_width=video_width,
+                target_height=video_height,
+            )
+            if canvas_detail:
+                detail = f"{detail} | {canvas_detail}".strip(" |")
+            if not canvas_ok and status == "generated":
+                status = "generated_with_postprocess_warning"
+
         generated_files.append(out_path)
         image_clips.append(
             {
@@ -1580,6 +1648,8 @@ def _generate_scene_images(
     report_path = images_dir / "image_generation_report.json"
     report_payload = {
         "image_model": model_name,
+        "image_aspect_ratio": selected_aspect_ratio,
+        "target_canvas": f"{video_width}x{video_height}",
         "total_items": len(items),
         "generated_images": len(items) - fallback_count,
         "reused_images": reused_count,
@@ -2372,6 +2442,7 @@ def generate_vertex_video_run(
         base,
         video_title=video_title,
         image_model_name=image_model_name or VERTEX_IMAGE_MODEL,
+        image_aspect_ratio=selected_aspect_ratio,
         video_width=video_width,
         video_height=video_height,
     )
